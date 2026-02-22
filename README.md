@@ -1713,9 +1713,7 @@ if model.predict_proba(features)[0][1] > 0.7:  # was 0.5
 
 ## Contributors
 
-- Training & ML: [Your Name]
-- Platform Engineering: [Your Name]
-- Operations & Monitoring: [Your Name]
+- Team Sorbonne
 
 ---
 
