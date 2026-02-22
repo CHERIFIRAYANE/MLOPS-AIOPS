@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiops-engine
+  namespace: aiops
+  labels:
+    app: aiops-engine
+    tier: analytics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aiops-engine
+  template:
+    metadata:
+      labels:
+        app: aiops-engine
+        tier: analytics
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: aiops-engine
+          image: aiops/aiops-engine:latest
+          imagePullPolicy: Never
+          env:
+            - name: PROMETHEUS_URL
+              value: "http://prometheus:9090"
+            - name: MODELS_DIR
+              value: "/app/models"
+            - name: METRICS_PORT
+              value: "8000"
+          ports:
+            - containerPort: 8000
+              name: metrics
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "200m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          # Pipeline takes time to collect data, so longer timeout
+          startupProbe:
+            httpGet:
+              path: /metrics
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 8000
+            periodSeconds: 30
+            failureThreshold: 3
+      # Init containers to wait for dependencies
+      initContainers:
+        - name: wait-for-prometheus
+          image: busybox:latest
+          command:
+            - sh
+            - -c
+            - 'until wget -q -O- http://prometheus:9090/-/healthy; do echo "Waiting for Prometheus..."; sleep 2; done'
+
+        - name: wait-for-echo-server
+          image: busybox:latest
+          command:
+            - sh
+            - -c
+            - 'until nc -z echo-server 5000; do echo "Waiting for echo-server..."; sleep 2; done'
+
+        - name: wait-for-traffic-gen
+          image: busybox:latest
+          command:
+            - sh
+            - -c
+            - 'echo "Waiting 60s for traffic-gen to stabilize..."; sleep 60; echo "Ready to start pipeline"'
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pipeline-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiops-engine
+  namespace: aiops
+  labels:
+    app: aiops-engine
+spec:
+  selector:
+    app: aiops-engine
+  ports:
+    - name: metrics
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
