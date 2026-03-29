@@ -1,4 +1,29 @@
 #!/usr/bin/env python3
+# =============================================================================
+# pipeline.py  -  the main brain of the aiops engine
+# =============================================================================
+#
+# this file does one thing: it runs an infinite loop that watches the cluster
+# and uses a machine learning model to decide if something is wrong.
+#
+# the full loop (repeats every 5 seconds forever):
+#
+#   1. query prometheus  ->  pull ~23 metrics (cpu, latency, disk, network...)
+#   2. sliding window    ->  buffer the last 12 readings (= 1 minute of data)
+#   3. feature extract   ->  compute 6 stats per metric = 96 features per window
+#   4. data clean        ->  replace NaN / Inf with 0 so the model doesn't crash
+#   5. score with model  ->  randomforest says: normal (0) or anomaly (1)?
+#   6. classify type     ->  cpu_stress? slow_response? ddos? error_rate?
+#   7. publish metrics   ->  expose result at :8000/metrics so prometheus scrapes it
+#   8. save to csv       ->  append row to /data/cleaned_dataset.csv for retraining
+#
+# this file is structured as 5 classes + 1 entry point:
+#   PrometheusQueryEngine  -  talks to prometheus, returns raw metric snapshots
+#   SlidingWindowProcessor -  buffers last 12 snapshots, extracts 96 features
+#   DataCleaner            -  sanitizes feature dict (no NaN/Inf)
+#   AnomalyDetector        -  legacy unsupervised detector (kept as fallback)
+#   MetricsHandler         -  tiny http server that serves /metrics for prometheus
+#   AIOpsDataPipeline      -  orchestrates all of the above in one run() loop
 """
 AIOps Data Pipeline:
 1. Query Prometheus API every 5 seconds
@@ -8,6 +33,15 @@ AIOps Data Pipeline:
 5. Save cleaned dataset for ML training
 """
 
+# ── imports ──────────────────────────────────────────────────────────────────
+# requests       : send http calls to prometheus api
+# pandas/numpy   : dataframes for feature matrix, math for stats
+# deque          : the sliding window buffer (fixed-size, auto-drops oldest)
+# pickle         : load the trained randomforest model from .pkl file
+# threading      : run the /metrics http server on a background thread so the
+#                  main loop isn't blocked waiting for prometheus to scrape
+# sklearn        : StandardScaler (normalize features), IsolationForest + LOF
+#                  (legacy unsupervised detectors, kept as fallback)
 import requests
 import pandas as pd
 import numpy as np
@@ -25,22 +59,56 @@ from sklearn.ensemble import IsolationForest
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.preprocessing import StandardScaler
 
-# ── Model monitor (exposes Prometheus metrics) ───────────────────────────────
+# ── model monitor ────────────────────────────────────────────────────────────
+# model_monitor.py tracks live statistics: drift score, prediction counts,
+# anomaly rates. it also formats everything as prometheus exposition text
+# so grafana can graph them. imported as a module-level singleton (_monitor).
+# if the file doesn't exist (e.g. during unit tests) we just set it to None
+# and skip all monitoring calls with an 'if _monitor:' guard.
 try:
     from model_monitor import monitor as _monitor
 except ImportError:
     _monitor = None
 
-# ── Model paths ───────────────────────────────────────────────────────────────
-MODELS_DIR   = Path(os.getenv('MODELS_DIR', '/app/models'))
-MODEL_PKL    = MODELS_DIR / 'anomaly_detector.pkl'
-SCALER_PKL   = MODELS_DIR / 'scaler.pkl'
-FEATURE_JSON = MODELS_DIR / 'feature_list.json'
+# ── model file paths (read from environment variables) ───────────────────────
+# these point to the model artifacts baked into the docker image.
+# the kubernetes yaml sets MODELS_DIR=/app/models via the env: section.
+# the Dockerfile copies them in with: COPY models/ /app/models/
+#
+# anomaly_detector.pkl  = trained randomforest classifier (predict normal/anomaly)
+# scaler.pkl            = standardscaler (normalize the 96 features to mean=0 std=1)
+# feature_list.json     = ordered list of the 96 feature names the model expects
+#
+# all three must exist together — if any is missing, _load_model() skips scoring
+# and the pipeline falls back to data-collection-only mode.
+MODELS_DIR   = Path(os.getenv('MODELS_DIR', '/aiops-engine/models'))
+MODEL_DIR_CANDIDATES = [
+    Path('/data/models'),
+    MODELS_DIR,
+    Path('/aiops-engine/models'),
+]
 
+# port where this pod exposes its own prometheus metrics (anomaly scores etc.)
+# must match containerPort in 07-aiops-engine.yaml and the prometheus annotation.
 METRICS_PORT = int(os.getenv('METRICS_PORT', '8000'))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# section 1: prometheus query engine
+# =============================================================================
+# responsible for: connecting to prometheus and pulling raw metric values.
+#
+# on startup it:
+#   - waits for prometheus to be reachable (retries every 2s for up to 30 tries)
+#   - probes which metric names actually exist (http? node? container?)
+#   - logs a warning if any layer is missing (e.g. echo-server not running)
+#
+# every 5 seconds the main loop calls query_metrics() which fires ~23 promql
+# queries and returns a flat dict like:
+#   { 'http_request_rate': 4.2, 'system_cpu_usage_percent': 12.5, ... }
+# that dict is one 'sample' = one row in the sliding window.
 
 class PrometheusQueryEngine:
     """Query Prometheus API for metrics from all 3 layers"""
@@ -103,10 +171,18 @@ class PrometheusQueryEngine:
 
     
     def query_metrics(self, timestamp):
+        # this is the main data collection call. it groups queries into 4 layers
+        # so it's clear which part of the stack each metric comes from.
+        # each layer calls _execute_query() which handles errors and returns 0.0
+        # if prometheus doesn't have that metric yet (safe default).
         """Query metrics from 3 distinct layers"""
         metrics = {'timestamp': timestamp}
         
-        # Layer 1: Application Level Metrics (HTTP/App performance) ✓ WORKING CORRECTLY
+        # layer 1: application metrics (from echo-server via prometheus)
+        # these come from the flask app's /metrics endpoint.
+        # request_rate = how many http calls/sec are hitting the echo-server.
+        # p50/p95/p99 latency = response time percentiles over the last 1 minute.
+        # why percentiles? averages hide tail latency. p99=2s means 1% of users wait 2s.
         app_queries = {
             'http_request_rate': 'rate(http_requests_total[1m])',
             'http_p95_latency': 'histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[1m]))',
@@ -117,9 +193,11 @@ class PrometheusQueryEngine:
         for metric_name, query in app_queries.items():
             metrics[metric_name] = self._execute_query(query, metric_name)
         
-        # Layer 2: System CPU & Memory Metrics (from node-exporter) ✓ FIXED: Use rate() for CPU
-        # CPU is a counter of seconds, so rate() = CPU utilization
-        # Memory is a gauge, so query directly
+        # layer 2: system/os metrics (from node-exporter running on the host)
+        # node-exporter is a DaemonSet that exposes the underlying VM's stats.
+        # cpu is a COUNTER (always goes up), so we wrap it in rate() to get utilization.
+        # memory is a GAUGE (current value), so we query it directly.
+        # load_avg = number of processes waiting for cpu. >1.0 = system is busy.
         system_queries = {
             'system_cpu_usage_percent': 'rate(node_cpu_seconds_total[5m]) * 100',  # FIXED: rate() for counter
             'system_cpu_user': 'rate(node_cpu_seconds_total{mode="user"}[5m])',     # User mode CPU
@@ -133,8 +211,10 @@ class PrometheusQueryEngine:
         for metric_name, query in system_queries.items():
             metrics[metric_name] = self._execute_query(query, metric_name)
         
-        # Layer 3: Node Level Metrics (Hardware/OS - Network, Disk, Load) ✓ FIXED: Use rate()
-        # These are counters (monotonically increasing), so rate() = throughput
+        # layer 3: node-level i/o metrics (network + disk, from node-exporter)
+        # all of these are COUNTERS so we use rate() to get bytes/sec or packets/sec.
+        # without rate(): the value would just grow to billions and be useless.
+        # with rate(): we get meaningful throughput numbers like '1.2 MB/s disk write'.
         node_queries = {
             'node_network_transmit_bytes_per_sec': 'rate(node_network_transmit_bytes_total[5m])',  # FIXED: rate()
             'node_network_receive_bytes_per_sec': 'rate(node_network_receive_bytes_total[5m])',    # FIXED: rate()
@@ -148,8 +228,10 @@ class PrometheusQueryEngine:
         for metric_name, query in node_queries.items():
             metrics[metric_name] = self._execute_query(query, metric_name)
         
-        # Layer 4: Container Metrics (from cAdvisor via kubelet) ✓ NEW: Container metrics
-        # These metrics aggregate across all pods in the cluster
+        # layer 4: container metrics (from cadvisor, built into the kubelet)
+        # cadvisor tracks resource usage per-container (not per-node).
+        # we sum across all pods to get cluster-wide container resource usage.
+        # these may return 0 if cadvisor isn't available in this cluster setup.
         container_queries = {
             'container_cpu_usage_percent': 'sum(rate(container_cpu_usage_seconds_total{pod_name!="",pod_name!="POD"}[5m])) * 100',
             'container_memory_working_set_bytes': 'sum(container_memory_working_set_bytes{pod_name!="",pod_name!="POD"})',
@@ -209,6 +291,28 @@ class PrometheusQueryEngine:
             logger.warning(f"Unexpected error querying {metric_name}: {str(e)}")
             return 0.0
 
+# =============================================================================
+# section 2: sliding window processor
+# =============================================================================
+# responsible for: turning a stream of 5-second snapshots into 1-minute features.
+#
+# the problem with raw snapshots: they're too noisy.
+# a single cpu spike at t=0 might just be a 5-second blip — not a real issue.
+# but if cpu is high for 12 consecutive readings (60 seconds), that IS a real issue.
+#
+# so instead of feeding each snapshot directly to the model, we buffer
+# the last 12 snapshots in a deque (maxlen=12 = auto-drops oldest when full).
+# once the buffer is full, we extract 6 statistics per metric:
+#   mean  - average level over 1 minute
+#   std   - how much it fluctuated (high std = instability)
+#   min   - lowest point (useful for 'did latency ever spike?')
+#   max   - highest point
+#   p95   - 95th percentile (like max but less sensitive to one-off outliers)
+#   trend - last_value - first_value (positive = going up, negative = going down)
+#
+# 16 raw metrics × 6 stats = 96 features per window.
+# these 96 features are what the randomforest model actually sees.
+
 class SlidingWindowProcessor:
     """Create windowed features (12 points = 1 minute sliding window)"""
     
@@ -246,6 +350,21 @@ class SlidingWindowProcessor:
         
         return features
 
+# =============================================================================
+# section 3: data cleaner
+# =============================================================================
+# responsible for: making sure no bad values reach the model.
+#
+# why do we need this? some prometheus queries return:
+#   - NaN  (not a number): happens when rate() has no data yet at startup
+#   - Inf  (infinity): happens with division by zero in promql
+#   - extremely large values (> 1e10): can happen with counter resets
+#
+# sklearn models raise exceptions or produce garbage predictions on NaN/Inf.
+# the cleaner replaces all of these with 0.0 (a safe neutral value).
+# this way even if prometheus returns junk for one metric, the pipeline
+# keeps running and the model still gets a valid 96-element vector.
+
 class DataCleaner:
     """Clean and normalize data for ML training"""
     
@@ -271,6 +390,29 @@ class DataCleaner:
                     cleaned[key] = 0.0
         
         return cleaned
+
+# =============================================================================
+# section 4: legacy unsupervised anomaly detector  (NOT used in v2.0)
+# =============================================================================
+# this class was the original v1.0 detection approach.
+# it uses two unsupervised algorithms that DON'T need labeled training data:
+#
+#   isolation forest  - builds random decision trees. points that are easy to
+#                       isolate (far from others) get high anomaly scores.
+#                       good at detecting global outliers.
+#
+#   local outlier factor (lof) - compares each point's density to its neighbors.
+#                       a point in a sparse region = outlier.
+#                       good at detecting local anomalies in dense data.
+#
+# why did we replace it? unsupervised = no labels = no anomaly types.
+# it could say 'anomaly!' but not 'this is cpu_stress' or 'this is ddos'.
+# v2.0 uses supervisied randomforest (trained on labeled phases from locust)
+# which gives us both detection AND classification.
+#
+# this class is kept as a fallback: if no .pkl file is found at startup,
+# the pipeline could theoretically fall back to this. in practice we always
+# have the .pkl so this class never runs in the current setup.
 
 class AnomalyDetector:
     """Real-time anomaly detection using ensemble methods"""
@@ -371,12 +513,45 @@ class AnomalyDetector:
             return {'is_anomaly': False, 'score': 0.0, 'confidence': 0.0, 'error': str(e)}
 
 
-# ── Prometheus /metrics HTTP handler ─────────────────────────────────────────
+# =============================================================================
+# section 5: prometheus metrics http server
+# =============================================================================
+# responsible for: exposing the pipeline's own predictions as prometheus metrics.
+#
+# how the data flows OUT of the pipeline:
+#   pipeline.py scores a window  ->  calls _monitor.record(is_anomaly, score, ...)
+#   model_monitor.py stores it   ->  updates internal counters and gauges
+#   prometheus scrapes :8000/metrics  ->  calls MetricsHandler.do_GET()
+#   MetricsHandler calls _monitor.prometheus_metrics()  ->  returns formatted text
+#   grafana queries prometheus  ->  shows the anomaly score on the dashboard
+#
+# the server runs in a background thread (daemon=True) so it doesn't block
+# the main loop. 'daemon=True' means: if the main process exits, this thread
+# is automatically killed too (no orphaned server processes).
+#
+# what prometheus scrapes looks like (exposition format):
+#   anomaly_score 0.87
+#   is_anomaly 1
+#   anomaly_type{type="cpu_stress"} 1
+#   model_drift_score 0.12
+
 class MetricsHandler(BaseHTTPRequestHandler):
     """Minimal HTTP handler that serves Prometheus-format /metrics."""
     def do_GET(self):
         if self.path == '/metrics':
-            body = _monitor.prometheus_metrics().encode() if _monitor else b'# monitor unavailable\n'
+            base_metrics = _monitor.prometheus_metrics() if _monitor else '# monitor unavailable\n'
+            mlops_metrics_path = Path('/shared/mlops_metrics.txt')
+
+            if mlops_metrics_path.exists():
+                try:
+                    mlops_metrics = mlops_metrics_path.read_text(encoding='utf-8').strip()
+                    if mlops_metrics:
+                        base_metrics = f"{base_metrics.rstrip()}\n{mlops_metrics}\n"
+                except Exception:
+                    # Never fail the endpoint because of supplemental MLOps metrics.
+                    pass
+
+            body = base_metrics.encode()
             self.send_response(200)
             self.send_header('Content-Type', 'text/plain; version=0.0.4')
             self.end_headers()
@@ -387,6 +562,23 @@ class MetricsHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # silence access log
         pass
 
+
+# =============================================================================
+# section 6: main pipeline orchestrator  (the class that ties everything together)
+# =============================================================================
+# this is the top-level class. it creates one instance of each component and
+# wires them together. the run() method IS the infinite 5-second loop.
+#
+# startup sequence (happens once when the pod starts):
+#   1. create PrometheusQueryEngine  -> wait for prometheus to be ready
+#   2. create SlidingWindowProcessor -> empty 12-slot deque
+#   3. create DataCleaner            -> stateless, no setup needed
+#   4. resume existing CSV           -> if /data/cleaned_dataset.csv exists,
+#                                       load it so we don't lose data on restart
+#   5. _load_model()                 -> load anomaly_detector.pkl + scaler.pkl
+#                                       + feature_list.json from /app/models/
+#   6. _start_metrics_server()       -> start background http server on port 8000
+#   7. run() is called from __main__ -> begins the infinite loop
 
 class AIOpsDataPipeline:
     """End-to-end pipeline: Ingest → Window → Clean → Infer → Save"""
@@ -414,24 +606,56 @@ class AIOpsDataPipeline:
         self.model_bundle  = None
         self.scaler        = None
         self.feature_cols  = None
+        self._active_model_dir = None
+        self._active_model_mtime = None
         self._load_model()
 
         # Start /metrics HTTP server in background thread
         self._start_metrics_server()
 
+    def _resolve_model_artifacts(self):
+        """Return first directory that contains all required model artifacts."""
+        seen = set()
+        for model_dir in MODEL_DIR_CANDIDATES:
+            model_dir = Path(model_dir)
+            if model_dir in seen:
+                continue
+            seen.add(model_dir)
+
+            model_pkl = model_dir / 'anomaly_detector.pkl'
+            scaler_pkl = model_dir / 'scaler.pkl'
+            feature_json = model_dir / 'feature_list.json'
+            if model_pkl.exists() and scaler_pkl.exists() and feature_json.exists():
+                return model_dir, model_pkl, scaler_pkl, feature_json
+        return None, None, None, None
+
     def _load_model(self):
-        """Load trained model bundle from /app/models/ (if present)."""
-        if MODEL_PKL.exists() and SCALER_PKL.exists() and FEATURE_JSON.exists():
+        # loads the three model artifacts from /app/models/ inside the container.
+        # these files were copied in during 'docker build' via:
+        #   COPY models/ /app/models/
+        # so they are always present unless you run the image without building first.
+        #
+        # the model_bundle is a dict saved by train_model.py containing:
+        #   { 'classifier': RandomForestClassifier, 'version': '2.0',
+        #     'n_training_samples': 335, 'feature_names': [...] }
+        #
+        # if loading fails, self.model_bundle stays None and score_window() returns
+        # {'is_anomaly': 0, 'score': 0.0} without crashing the pipeline.
+        """Load trained model bundle from /app/models/ (if present.)"""
+        model_dir, model_pkl, scaler_pkl, feature_json = self._resolve_model_artifacts()
+        if model_pkl and scaler_pkl and feature_json:
             try:
-                with open(MODEL_PKL, 'rb') as f:
+                with open(model_pkl, 'rb') as f:
                     self.model_bundle = pickle.load(f)
-                with open(SCALER_PKL, 'rb') as f:
+                with open(scaler_pkl, 'rb') as f:
                     self.scaler = pickle.load(f)
-                with open(FEATURE_JSON) as f:
+                with open(feature_json) as f:
                     self.feature_cols = json.load(f)
+                self._active_model_dir = model_dir
+                self._active_model_mtime = model_pkl.stat().st_mtime
                 logger.info(f"Model loaded: {self.model_bundle.get('version','?')} "
                             f"({self.model_bundle.get('n_training_samples','?')} training samples, "
-                            f"{len(self.feature_cols)} features)")
+                            f"{len(self.feature_cols)} features) from {model_dir}")
                 if _monitor:
                     _monitor.model_version = self.model_bundle.get('version', '1.0')
                     _monitor.training_mean = self.scaler.mean_
@@ -440,6 +664,26 @@ class AIOpsDataPipeline:
                 logger.warning(f"Could not load model: {e}. Running in data-collection mode.")
         else:
             logger.warning("No model found — running in data-collection mode (no scoring).")
+
+    def _reload_model_if_updated(self):
+        """Hot-reload model artifacts when retraining writes a newer model file."""
+        model_dir, model_pkl, scaler_pkl, feature_json = self._resolve_model_artifacts()
+        if not model_pkl:
+            return
+
+        try:
+            model_mtime = model_pkl.stat().st_mtime
+        except OSError:
+            return
+
+        needs_reload = (
+            self._active_model_dir != model_dir
+            or self._active_model_mtime is None
+            or model_mtime > self._active_model_mtime
+        )
+        if needs_reload:
+            logger.info(f"Detected updated model artifacts in {model_dir}; reloading model")
+            self._load_model()
 
     def _start_metrics_server(self):
         """Start Prometheus /metrics HTTP server on METRICS_PORT."""
@@ -491,17 +735,27 @@ class AIOpsDataPipeline:
                  float(contribs[i]))
                 for i in top_idx
             ]
-            top_name = top_feats[0][0] if top_feats else ''
-            if any(k in top_name for k in ('request_rate', 'active_conn')):
-                atype = 'ddos'
-            elif any(k in top_name for k in ('p50_latency', 'p95_latency', 'p99_latency', 'latency')):
-                atype = 'slow_response'
-            elif any(k in top_name for k in ('error_rate', '5xx', 'error')):
-                atype = 'error_rate'
-            elif any(k in top_name for k in ('cpu', 'load')):
-                atype = 'cpu_stress'
-            else:
-                atype = 'unknown'
+
+            # Classify from the top contributors, not just the single top feature.
+            scores = {
+                'ddos': 0.0,
+                'slow_response': 0.0,
+                'error_rate': 0.0,
+                'cpu_stress': 0.0,
+            }
+            for raw_name, _human_name, weight in top_feats:
+                name = raw_name.lower()
+                if any(k in name for k in ('request_rate', 'active_conn', 'network_transmit_packets', 'network_receive_packets')):
+                    scores['ddos'] += weight
+                if any(k in name for k in ('p50_latency', 'p95_latency', 'p99_latency', 'latency')):
+                    scores['slow_response'] += weight
+                if any(k in name for k in ('error_rate', 'http_5xx', '5xx', 'error')):
+                    scores['error_rate'] += weight
+                if any(k in name for k in ('cpu', 'load', 'memory', 'disk', 'network_', 'io_time')):
+                    scores['cpu_stress'] += weight
+
+            best_type = max(scores, key=scores.get)
+            atype = best_type if scores[best_type] > 0 else 'unknown'
             return atype, top_feats
         except Exception as e:
             logger.warning(f"classify_anomaly error: {e}")
@@ -561,6 +815,26 @@ class AIOpsDataPipeline:
         return result
     
     def run(self, duration_seconds=600, query_interval=5):
+        # =====================================================================
+        # the main loop  -  this is where everything happens
+        # =====================================================================
+        # called from __main__ with duration_seconds=86400 (24 hours).
+        # kubernetes restarts the pod if it ever exits (or fails a liveness probe).
+        #
+        # each iteration (every 5 seconds):
+        #   step 1: query_engine.query_metrics()   -> 23 promql calls -> raw dict
+        #   step 2: window_processor.process()     -> add to deque, return features
+        #                                             (returns None for first 11 calls
+        #                                              while the window fills up)
+        #   step 3: cleaner.clean()                -> replace NaN/Inf with 0.0
+        #   step 3b: score_window()                -> randomforest predict + proba
+        #   step 4: append to all_features list    -> will be saved to csv
+        #   step 5: every 5 windows: _save_dataset() -> write csv to /data/
+        #
+        # the 'if window_count % 10 == 0 or score_result[is_anomaly]' log line
+        # is what you see in: kubectl logs -n aiops deployment/aiops-engine
+        #   -> 'window=  40  score=0.0312'
+        #   -> 'ANOMALY  ->  Type: CPU_STRESS  Top causes: CPU Usage'
         """Run pipeline for X seconds, querying Prometheus every ~5 seconds"""
         logger.info(f"🚀 AIOps Pipeline started for {duration_seconds}s (window: 12×5s = 60s)")
         start_time = time.time()
@@ -569,6 +843,8 @@ class AIOpsDataPipeline:
         
         while time.time() - start_time < duration_seconds:
             try:
+                self._reload_model_if_updated()
+
                 # Step 1: Query Prometheus
                 current_time = datetime.now()
                 metrics = self.query_engine.query_metrics(current_time)
@@ -617,6 +893,19 @@ class AIOpsDataPipeline:
         logger.info(f"   Windowed records: {len(self.all_features)}")
     
     def _save_dataset(self):
+        # writes all collected windows to /data/cleaned_dataset.csv.
+        # this file is on the PVC (persistent volume claim) so it survives
+        # pod restarts. without the PVC it would be lost every time the pod crashes.
+        #
+        # also logs a quality report:
+        #   'active features'   = columns that have changed (variance > 0)
+        #   'dead metrics'      = columns that are all-zero (metric not available)
+        # dead metrics are columns where prometheus returned 0.0 every single query
+        # (e.g. container metrics if cadvisor isn't running). train_model.py drops
+        # them automatically during prepare_dataset.py preprocessing.
+        #
+        # how to extract this file for retraining:
+        #   kubectl exec -n aiops <pod-name> -- cat /data/cleaned_dataset.csv > data/cleaned_dataset.csv
         """Save cleaned dataset to CSV for ML training"""
         if not self.all_features:
             logger.warning("No data to save")
@@ -657,7 +946,24 @@ class AIOpsDataPipeline:
         logger.info(f"   2. Rate window (5m) has enough data points")
         logger.info(f"   3. Metric exists: curl http://prometheus:9090/api/v1/label/__name__/values")
 
+# =============================================================================
+# entry point
+# =============================================================================
+# when kubernetes starts the container it runs: python pipeline.py
+# (defined in the Dockerfile CMD instruction).
+#
+# we create one AIOpsDataPipeline instance and call run() with 86400 seconds = 24h.
+# in practice it runs until:
+#   a) 24h elapses  -> pod exits cleanly -> kubernetes restarts it immediately
+#   b) an unhandled exception crashes it -> kubernetes restarts (liveness probe)
+#   c) you do 'kubectl rollout restart' -> kubernetes creates new pod, kills old one
+#
+# PROMETHEUS_URL and MODELS_DIR are injected by kubernetes via the env: section
+# in 07-aiops-engine.yaml. if running locally for testing you'd set them manually.
 if __name__ == '__main__':
-    # Run indefinitely (restart handled by Kubernetes if needed)
-    pipeline = AIOpsDataPipeline()
-    pipeline.run(duration_seconds=86400)  # 24h — Kubernetes restarts if it exits
+    # run indefinitely (restart handled by kubernetes if needed)
+    pipeline = AIOpsDataPipeline(
+        prometheus_url=os.getenv('PROMETHEUS_URL', 'http://prometheus:9090'),
+        output_file='/data/cleaned_dataset.csv',
+    )
+    pipeline.run(duration_seconds=86400)  # 24h — kubernetes restarts if it exits

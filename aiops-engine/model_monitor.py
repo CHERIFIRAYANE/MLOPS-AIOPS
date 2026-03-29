@@ -15,6 +15,7 @@ import time
 import json
 import pickle
 import threading
+import os
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -38,7 +39,7 @@ HUMAN_TYPES = {
     'unknown':       'Unknown',
 }
 
-MODELS_DIR   = Path('/app/models')
+MODELS_DIR   = Path(os.getenv('MODELS_DIR', '/aiops-engine/models'))
 FEATURE_JSON = MODELS_DIR / 'feature_list.json'
 SCALER_PKL   = MODELS_DIR / 'scaler.pkl'
 
