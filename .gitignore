@@ -35,3 +35,12 @@ Thumbs.db
 .idea/
 .vscode/
 *.code-workspace
+# Local envs & artifacts
+.env
+.env.*
+*.log
+*.sqlite3
+*.db
+pip-wheel-metadata/
+coverage.xml
+htmlcov/
