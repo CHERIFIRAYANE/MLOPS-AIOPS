@@ -243,307 +243,110 @@ AiOPs/
 ├── monitoring/                         # Data exploration scripts
 │   ├── drift_analysis.py
 │   ├── evaluate_current_model.py
-│   └── get_data_for_retraining.py
-├── training/                           # Initial model training
-│   ├── prepare_dataset.py
-│   └── train_model.py
-└── k8s/                                # Kubernetes manifests
-    ├── 01-namespace.yaml
-    ├── 02-prometheus-config.yaml
-    ├── 03-pvc.yaml
-    ├── 04-prometheus.yaml
-    ├── 05-echo-server.yaml
-    ├── 06-traffic-gen.yaml
-    ├── 07-aiops-engine.yaml
-    ├── 08-node-exporter.yaml
-    ├── 09-grafana.yaml
-    ├── 13-drift-detection-cronjob.yaml
-    ├── 14-retraining-job.yaml
-    ├── 15-grafana-mlops-dashboard.yaml
-    └── 16-mlops-config.yaml
-```
+# Plateforme AIOps : détection d'anomalies et réentraînement automatique
 
----
+Ce dépôt contient un projet de démonstration d'une chaîne MLOps déployée
+sur Kubernetes. L'objectif est de montrer l'ensemble du flux : collecte de
+métriques, inférence en temps réel, détection de dérive, réentraînement
+automatique et visualisation.
 
-## Drift Detection & Auto-Retraining
+Principes clés
+---------------
 
-### Architecture
+- Collecte de métriques via Prometheus.
+- Inférence en temps réel dans `aiops-engine`, qui exporte des métriques
+   d'anomalie vers Prometheus.
+- Détection de dérive périodique via un CronJob Kubernetes. Si plusieurs
+   conditions sont réunies, un job de réentraînement est déclenché.
+- Les modèles binaires ne sont pas inclus dans le dépôt final. Ils sont
+   générés ou fournis séparément afin de garder le dépôt léger.
 
-Every 5 minutes, `aiops-drift-detection` CronJob checks if the model needs retraining:
+Prérequis
+---------
 
-```
-┌─────────────────────────────────────────┐
-│ Load saved model from persistent volume │
-└──────────────────┬──────────────────────┘
-                   ↓
-┌─────────────────────────────────────────┐
-│ Extract data from last 24 hours         │
-│ Filter: timestamp >= (now - 24h)        │
-└──────────────────┬──────────────────────┘
-                   ↓
-┌─────────────────────────────────────────┐
-│ Evaluate model on 24h window            │
-│ Calculate: ROC-AUC, Accuracy, Precision │
-└──────────────────┬──────────────────────┘
-                   ↓
-┌─────────────────────────────────────────┐
-│ Check all retraining gates:             │
-│                                          │
-│ Gate 1: Drift detected?                 │
-│   Is ROC-AUC < 0.80?                   │
-│                                          │
-│ Gate 2: Sufficient samples?             │
-│   Are there >= 200 samples?             │
-│                                          │
-│ Gate 3: Rate limiting?                  │
-│   Is it > 24h since last retrain?      │
-│                                          │
-│ ALL gates must be YES for retraining    │
-└──────────────────┬──────────────────────┘
-                   ↓
-          ┌────────┴────────┐
-          ↓                 ↓
-    [Drift Found]    [No Drift/Gates Blocked]
-          ↓                 ↓
-   Trigger Job        Log to mlops_status.json
-         ↓
-┌─────────────────────────────────────────┐
-│ auto_retrain_pipeline.py runs:          │
-│ 1. Load recent data                     │
-│ 2. Train new model                      │
-│ 3. Evaluate on test set                 │
-│ 4. Deploy if better than current        │
-│ 5. Service hot-reloads automatically    │
-└─────────────────────────────────────────┘
-```
+- Docker Desktop (Kubernetes activé) ou un cluster Kubernetes accessible.
+- `kubectl` configuré pour accéder au cluster.
+- Python 3.11 pour exécuter les scripts de formation et d'inférence.
 
-### Code Example
+Installation rapide en local
+---------------------------
 
-```python
-# From detect_and_trigger_retrain.py
-def check_drift(self):
-    # Step 1: Load trained model
-    model = joblib.load(self.model_path)
-
-    # Step 2: Get last 24 hours of data
-    df = self._extract_last_24h()  # Filters: timestamp >= (now - 24h)
-
-    # Step 3: Evaluate performance
-    roc_auc = self._evaluate_model(model, df)  # Calculates ROC-AUC
-
-    # Step 4: Check all gates
-    drift_detected = roc_auc < 0.80              # Gate 1
-    enough_samples = len(df) >= 200              # Gate 2
-    old_enough = self._hours_since_retrain() > 24  # Gate 3
-
-    # Step 5: Trigger if all gates pass
-    if drift_detected and enough_samples and old_enough:
-        logger.info("🔄 Triggering retraining...")
-        self._launch_retraining_job()
-    else:
-        logger.info(f"✓ Model health good. ROC-AUC={roc_auc:.4f}")
-```
-
----
-
-## Problems Faced & Solutions
-
-### Problem 1: "Why isn't the model retraining?"
-
-**What We Observed:**
-
-- Drift detection showed score stuck at ~54% for hours
-- Retraining status remained "Idle"
-- Console shows "No data available from last 24h"
-
-**Root Cause:**
-
-- Local PC was paused for 2 days
-- When rebooted, only 175 samples had been collected in the window
-- `MIN_SAMPLES_FOR_RETRAIN=200` blocked training as a safety gate
-
-**Solution:**
-
-- Added comprehensive debug logging to `_extract_last_24h()` method showing:
-  - Total rows loaded
-  - Raw timestamp samples
-  - Cutoff time (24h ago UTC)
-  - Min/max timestamps in data
-  - Filtered row count after time filtering
-- Verified system correctly accumulated 250→445 samples when running continuously
-- System CORRECTLY blocked retraining on insufficient data (safety feature)
-
-**Lesson:** The implementation of the the safety gates are intentional features to prevent overfitting on small datasets. The system was working as designed.
-
-### Problem 2: "CronJob job shows 0 samples but deployment sees 250+"
-
-**What We Observed:**
-
-- Manual drift detection job from CronJob template showed "No data available from last 24h"
-- But the same CSV mounted on deployment pod had 250+ samples
-- Both used identical `pipeline-data` PVC
-
-**Root Cause:**
-
-- Docker image was cached with old code
-- CronJob was using old Python script without debug logging
-- Kubernetes uses `imagePullPolicy: IfNotPresent`, so doesn't auto-update local images
-
-**Solution:**
-
-1. Rebuilt Docker image without cache:
-   ```bash
-   docker build --no-cache -t aiops-engine:latest .
-   ```
-2. Deleted pods to force new image pull:
-   ```bash
-   kubectl delete pod -n aiops -l app=aiops-engine
-   ```
-3. Redeployed with updated code:
-   ```bash
-   kubectl apply -f k8s/
-   ```
-4. Verified new code by checking logs for debug output
-
-**Lesson:** to always rebuild without cache after code changes in development. We Considered using `imagePullPolicy: Always` during iteration, `IfNotPresent` for production stability.
-
-### Problem 3: "Storage running low - CSV is 17.8 MB taking too much space"
-
-**What We Observed:**
-
-- PC storage nearly full
-- CSV at 11,700 rows × 96 features ≈ 17.8 MB
-- Docker images consuming 20+ GB
-
-**Root Cause:**
-
-- Docker cached 36 images with layers
-- 9.957 GB build cache from iterations
-- CSV data intentionally growing (needed for model evaluation)
-
-**Solution:**
-
-1. Cleaned Docker storage (NOT the CSV):
-
-   ```bash
-   docker system prune -a --volumes -f
-   ```
-
-   - Freed ~24.9 GB (73% of image storage)
-   - Freed ~9.957 GB build cache
-   - Kept only 18 active images needed for system
-
-2. Kept CSV intact for:
-   - Audit trail (production-critical)
-   - Retraining data source (more samples = better models)
-   - Historical analysis (drift tracking across weeks)
-
-3. We could optionally add data retention later:
-   ```python
-   # Keep only last 30 days of data
-   retention_cutoff = datetime.utcnow() - timedelta(days=30)
-   ```
-
-**Lesson:** A docker cleanup is often better than deleting active data. We opted to use storage cleanup regularly. CSV is an asset, not a liability.
-
----
-
-## Useful Commands
-
-### Deployment & Status
+1. Cloner le dépôt :
 
 ```bash
-# Overall status
-kubectl get all -n aiops
+git clone <repo-url>
+cd AiOPs
+```
 
-# Watch deployments in real-time
+2. Construire les images Docker locales :
+
+```bash
+docker build -t aiops-engine:local ./aiops-engine
+docker build -t echo-server:local ./echo-server
+docker build -t traffic-gen:local ./traffic-gen
+```
+
+3. Déployer les manifests Kubernetes :
+
+```bash
+kubectl apply -f k8s/
 kubectl get pods -n aiops -w
-
-# Detailed pod info (debugging init failures)
-kubectl describe pod -n aiops <pod-name>
-
-# Check resource usage
-kubectl top pods -n aiops
 ```
 
-### Logs & Debugging
+4. Pour accéder à Grafana :
 
 ```bash
-# Real-time logs from inference service
-kubectl logs -n aiops deployment/aiops-engine -f
-
-# Last 100 lines from a pod
-kubectl logs -n aiops deployment/aiops-engine --tail=100
-
-# Logs from all containers in pod (useful if multiple containers)
-kubectl logs -n aiops <pod-name> --all-containers=true
-
-# If pod crashed, see previous logs
-kubectl logs -n aiops <pod-name> --previous
+kubectl port-forward -n aiops svc/grafana 3000:3000
+# ouvrir http://localhost:3000 (identifiants par défaut fournis localement)
 ```
 
-### Manual Drift Detection
+Remarques sur les modèles
+-------------------------
 
-```powershell
-# Trigger drift detection immediately (normally every 5 min)
-$timestamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddHHmmss')
-kubectl create job --from=cronjob/aiops-drift-detection manual-check-$timestamp -n aiops
-
-# Wait for it to complete
-Start-Sleep -Seconds 30
-
-# Check results (Windows PowerShell)
-kubectl logs -n aiops -l job-name=manual-check-$timestamp --tail=50
-```
-
-### Data Access
-
-```powershell
-# Check CSV row count
-kubectl exec -n aiops deployment/aiops-engine -- wc -l /data/cleaned_dataset.csv
-# OR on Windows: kubectl exec -n aiops deployment/aiops-engine -- sh -c "cat /data/cleaned_dataset.csv | wc -l"
-
-# View last 5 rows
-kubectl exec -n aiops deployment/aiops-engine -- tail -5 /data/cleaned_dataset.csv
-
-# Get model metrics (Windows PowerShell)
-kubectl exec -n aiops deployment/aiops-engine -- cat /shared/mlops_status.json | Select-String "roc_auc|accuracy"
-
-# Download status file locally
-kubectl cp aiops/$(kubectl get pod -n aiops -l app=aiops-engine -o jsonpath='{.items[0].metadata.name}'):/shared/mlops_status.json ./backup.json
-```
-
-### Configuration Changes
-
-```powershell
-# View CronJob schedule (Windows PowerShell)
-kubectl get cronjob aiops-drift-detection -n aiops -o yaml | Select-String -Pattern "schedule"
-
-# Temporarily change drift threshold (demo only)
-kubectl set env cronjob/aiops-drift-detection DRIFT_THRESHOLD=0.70 -n aiops
-
-# Reset to default
-kubectl set env cronjob/aiops-drift-detection DRIFT_THRESHOLD=0.80 -n aiops
-```
-
-### Cleanup
+Les fichiers `*.pkl` contenant les modèles et les scalers sont exclus du
+contrôle de version. Pour régénérer les modèles localement :
 
 ```bash
-# Delete entire namespace (WARNING: loses data)
-kubectl delete namespace aiops
-
-# Clean Docker storage (frees ~25 GB)
-docker system prune -a --volumes -f
-
-# Remove only unused images (safer)
-docker image prune -a
+python training/train_model.py
 ```
 
----
+ou copier vos modèles compilés dans :
 
-## Verification & Monitoring
+- `aiops-engine/models/`
+- `training/models/`
 
-### ✅ Step 1: Verify All Pods Running
+CI et sécurité
+---------------
+
+Une pipeline CI GitHub Actions est incluse dans `.github/workflows/ci.yml`.
+Elle exécute linting, analyses de sécurité statique et construit les images
+Docker sans les pousser vers un registre. Un script `scripts/scan_secrets.py`
+permet de vérifier rapidement l'absence de secrets avant publication.
+
+Structure principale du dépôt
+-----------------------------
+
+- `aiops-engine/` : service d'inférence et d'export Prometheus.
+- `training/` : scripts pour préparer les données et entraîner le modèle.
+- `echo-server/` : application HTTP simulée pour générer trafic.
+- `traffic-gen/` : générateur de charge (Locust).
+- `k8s/` : manifests Kubernetes pour déploiement local.
+- `monitoring/` : scripts d'analyse et génération de rapports.
+
+Comment contribuer
+------------------
+
+1. Créer une branche pour vos modifications.
+2. Exécuter `scripts/scan_secrets.py` avant de pousser pour éviter d'exposer
+    des secrets.
+3. Ouvrir une Pull Request vers `main`.
+
+Contact
+-------
+
+Pour questions techniques ou instructions de déploiement supplémentaires,
+ouvrez une issue dans le dépôt.
+
 
 ```bash
 kubectl get pods -n aiops
