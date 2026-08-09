@@ -20,127 +20,110 @@ A production-ready end-to-end Machine Learning Operations (MLOps) system that **
 
 ---
 
-## System Architecture
+# Plateforme AIOps : détection d'anomalies et réentraînement automatique
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                   AIOps ANOMALY DETECTION PLATFORM                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                            │
-│ WORKLOAD GENERATION (Simulates traffic + anomalies)                     │
-│ ┌────────────────────────┐         ┌──────────────────────┐             │
-│ │   echo-server:5000     │←────────│   traffic-gen        │             │
-│ │  Simulated HTTP app    │ (5s)    │  Load generator      │             │
-│ │  Exposes metrics on    │         │  7-phase cycle:      │             │
-│ │  /metrics endpoint     │         │   - warm-up (60s)    │             │
-│ │                        │         │   - steady (120s)    │             │
-│ └────────┬───────────────┘         │   - DDoS (60s)       │             │
-│          │                         │   - slow (60s)       │             │
-│          └─────────────────────────│   - errors (60s)     │             │
-│                                    │   - drop (60s)       │             │
-│ METRICS AGGREGATION                │   - CPU_spike (120s) │             │
-│ ┌────────────────────────────────┐ └──────────────────────┘             │
-│ │ Prometheus:9090 (5s scrape)    │ [Repeats every 540 seconds]         │
-│ │ ┌──────────────────────────────┤                                      │
-│ │ │ • Time-series database       │                                      │
-│ │ │ • Scrapes from 4 endpoints   │                                      │
-│ │ │ • Stores 40+ metric types    │                                      │
-│ │ │ • 11,700+ samples × 96       │                                      │
-│ │ │   features collected         │                                      │
-│ │ └──────────────────────────────┘                                      │
-│ └─────────────┬──────────────────────────────────────────────┘          │
-│               │                                                           │
-│ ML INFERENCE (Real-time anomaly detection)                              │
-│ ┌──────────────▼────────────────────────────────────────────┐          │
-│ │ aiops-engine:8000 (Python inference service)              │          │
-│ │ ┌──────────────────────────────────────────────────────┐ │          │
-│ │ │ Every 5 seconds:                                     │ │          │
-│ │ │ 1. Query Prometheus API → collect metrics           │ │          │
-│ │ │ 2. Maintain sliding window (12 samples = ~1 min)    │ │          │
-│ │ │ 3. Engineer features (96 dimensions)                │ │          │
-│ │ │ 4. Load trained RandomForest model                  │ │          │
-│ │ │ 5. Predict: is_anomaly + anomaly_score             │ │          │
-│ │ │ 6. Identify root cause (top-3 features)             │ │          │
-│ │ │ 7. Persist to CSV (audit trail)                     │ │          │
-│ │ │ 8. Export metrics to Prometheus                     │ │          │
-│ │ └──────────────────────────────────────────────────────┘ │          │
-│ └──────────────────────────────────────────────────────────┘          │
-│               │                                                          │
-│ DRIFT DETECTION (Every 5 minutes via CronJob)                          │
-│ ┌──────────────▼────────────────────────────────────────────┐          │
-│ │ detect_and_trigger_retrain.py (CronJob: */5 * * * *)     │          │
-│ │ ┌──────────────────────────────────────────────────────┐ │          │
-│ │ │ 1. Load trained model from /data/models/            │ │          │
-│ │ │ 2. Extract last 24 hours of data from CSV           │ │          │
-│ │ │ 3. Evaluate model performance (ROC-AUC)             │ │          │
-│ │ │ 4. Check: ROC-AUC < 0.80? (drift detected)          │ │          │
-│ │ │ 5. Check: Have 200+ samples? (sufficient data)      │ │          │
-│ │ │ 6. Check: >24h since last retrain? (not too freq)   │ │          │
-│ │ │ 7. If ALL conditions met → trigger retraining job   │ │          │
-│ │ │ 8. Log everything to mlops_status.json              │ │          │
-│ │ └──────────────────────────────────────────────────────┘ │          │
-│ └──────────────────────────────────────────────────────────┘          │
-│               │                                                          │
-│ AUTO-RETRAINING (Triggered when drift detected)                        │
-│ ┌──────────────▼────────────────────────────────────────────┐          │
-│ │ auto_retrain_pipeline.py (Kubernetes Job)                 │          │
-│ │ ┌──────────────────────────────────────────────────────┐ │          │
-│ │ │ 1. Load recent data from CSV                        │ │          │
-│ │ │ 2. Engineer features (same 96 dimensions)           │ │          │
-│ │ │ 3. Split: 80% train / 20% test                      │ │          │
-│ │ │ 4. Train new RandomForest (300 trees)               │ │          │
-│ │ │ 5. Evaluate on test set (ROC-AUC, accuracy)         │ │          │
-│ │ │ 6. Compare vs old model (improve = accept)          │ │          │
-│ │ │ 7. Save to /data/models/anomaly_detector.pkl        │ │          │
-│ │ │ 8. Service picks up new model automatically         │ │          │
-│ │ └──────────────────────────────────────────────────────┘ │          │
-│ └──────────────────────────────────────────────────────────┘          │
-│               │                                                          │
-│ VISUALIZATION (Human-friendly dashboards)                              │
-│ ┌──────────────▼────────────────────────────────────────────┐          │
-│ │ Grafana Dashboard                                          │          │
-│ │ (visible at: http://localhost:3000)                      │          │
-│ │ ┌──────────────────────────────────────────────────────┐ │          │
-│ │ │ Panels included:                                     │ │          │
-│ │ │ • HTTP Request Rate (req/s over time)               │ │          │
-│ │ │ • Response Latency (p50/p95/p99 ms)                │ │          │
-│ │ │ • Error Rate (% failed requests)                    │ │          │
-│ │ │ • CPU Usage (%)                                     │ │          │
-│ │ │ • ANOMALY SCORE (0-1, real-time prediction)        │ │          │
-│ │ │ • Anomaly Type (DDoS/Slow/Error/CPU labeled)       │ │          │
-│ │ │ • Root Cause Features (top-3 contributing)         │ │          │
-│ │ │ • Retraining Status (Idle/Running/Success)         │ │          │
-│ │ │ • Model Performance (ROC-AUC history)              │ │          │
-│ │ └──────────────────────────────────────────────────────┘ │          │
-│ └──────────────────────────────────────────────────────────┘          │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+Ce dépôt contient un projet de démonstration d'une chaîne MLOps déployée
+sur Kubernetes. L'objectif est de présenter le flux complet : collecte de
+métriques, inférence en temps réel, détection de dérive, réentraînement
+automatique et visualisation.
 
-KUBERNETES INFRASTRUCTURE (Namespace: aiops)
-├─ Deployments:
-│  ├─ aiops-engine (inference + monitoring)
-│  ├─ echo-server (load target)
-│  ├─ traffic-gen (load generator)
-│  ├─ prometheus (metrics DB)
-│  ├─ grafana (dashboards)
-│  └─ node-exporter (system metrics)
-├─ CronJobs:
-│  ├─ aiops-drift-detection (every 5 minutes)
-│  │  Triggers retraining job if drift detected
-├─ Persistent Volumes:
-│  ├─ pipeline-data (1Gi) → /data/cleaned_dataset.csv
-│  └─ aiops-shared (5Gi) → /shared/mlops_status.json
+Principes clés
+---------------
+
+- Collecte de métriques via Prometheus.
+- Inférence en temps réel dans `aiops-engine`, qui exporte des métriques
+   d'anomalie vers Prometheus.
+- Détection de dérive périodique via un CronJob Kubernetes. Si plusieurs
+   conditions sont réunies, un job de réentraînement est déclenché.
+- Les modèles binaires sont exclus du contrôle de version pour garder le
+   dépôt léger.
+
+Prérequis
+---------
+
+- Docker Desktop (Kubernetes activé) ou un cluster Kubernetes accessible.
+- `kubectl` configuré pour accéder au cluster.
+- Python 3.11 pour exécuter les scripts de formation et d'inférence.
+
+Installation rapide en local
+---------------------------
+
+1. Cloner le dépôt :
+
+```bash
+git clone <repo-url>
+cd AiOPs
 ```
 
----
+2. Construire les images Docker locales :
 
-## Key Features
+```bash
+docker build -t aiops-engine:local ./aiops-engine
+docker build -t echo-server:local ./echo-server
+docker build -t traffic-gen:local ./traffic-gen
+```
 
-### ✅ Automated Drift Detection
+3. Déployer les manifests Kubernetes :
 
-- **Every 5 minutes**: Evaluates model performance on recent data
-- **ROC-AUC threshold: 0.80** - If model performance drops below, triggers retraining
-- **Comprehensive logging**: Every check is logged to `mlops_status.json` for audit trail
+```bash
+kubectl apply -f k8s/
+kubectl get pods -n aiops -w
+```
+
+4. Pour accéder à Grafana :
+
+```bash
+kubectl port-forward -n aiops svc/grafana 3000:3000
+# ouvrir http://localhost:3000 (identifiants par défaut fournis localement)
+```
+
+Remarques sur les modèles
+-------------------------
+
+Les fichiers `*.pkl` contenant les modèles et les scalers sont exclus du
+contrôle de version. Pour régénérer les modèles localement :
+
+```bash
+python training/train_model.py
+```
+
+ou copier vos modèles compilés dans :
+
+- `aiops-engine/models/`
+- `training/models/`
+
+CI et sécurité
+---------------
+
+Une pipeline CI GitHub Actions est incluse dans `.github/workflows/ci.yml`.
+Elle exécute linting, analyses de sécurité statique et construit les images
+Docker sans les pousser vers un registre. Un script `scripts/scan_secrets.py`
+permet de vérifier rapidement l'absence de secrets avant publication.
+
+Structure principale du dépôt
+-----------------------------
+
+- `aiops-engine/` : service d'inférence et d'export Prometheus.
+- `training/` : scripts pour préparer les données et entraîner le modèle.
+- `echo-server/` : application HTTP simulée pour générer trafic.
+- `traffic-gen/` : générateur de charge (Locust).
+- `k8s/` : manifests Kubernetes pour déploiement local.
+- `monitoring/` : scripts d'analyse et génération de rapports.
+
+Comment contribuer
+------------------
+
+1. Créer une branche pour vos modifications.
+2. Exécuter `scripts/scan_secrets.py` avant de pousser pour éviter d'exposer
+    des secrets.
+3. Ouvrir une Pull Request vers `main`.
+
+Contact
+-------
+
+Pour questions techniques ou instructions de déploiement supplémentaires,
+ouvrez une issue dans le dépôt.
+
 
 ### ✅ Intelligent Auto-Retraining
 
