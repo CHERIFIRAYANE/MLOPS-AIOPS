@@ -1,12 +1,25 @@
 #!/bin/bash
 # AIOps Kubernetes Deployment Script
-# Builds Docker images and deploys all components to Kubernetes
+# Builds Docker images and deploys all components to Kubernetes with rollback on failed health probes
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 REGISTRY="aiops"  # Local registry name (Docker Desktop)
+IMAGE_TAG="${1:-latest}"
+NAMESPACE="aiops"
+
+rollback() {
+    echo ""
+    echo "❌ Deployment failed, rolling back affected deployments..."
+    kubectl rollout undo deployment/aiops-engine -n "$NAMESPACE" || true
+    kubectl rollout undo deployment/echo-server -n "$NAMESPACE" || true
+    kubectl rollout undo deployment/traffic-gen -n "$NAMESPACE" || true
+    echo "Rollback requested."
+}
+
+trap rollback ERR
 
 echo "========================================"
 echo "🚀 AIOps Kubernetes Deployment"
@@ -25,7 +38,7 @@ components=(
 
 for component in "${components[@]}"; do
     echo "Building $component..."
-    docker build -t "$REGISTRY/$component:latest" "$PROJECT_ROOT/$component"
+    docker build -t "$REGISTRY/$component:$IMAGE_TAG" "$PROJECT_ROOT/$component"
     echo "✅ $component built successfully"
 done
 
@@ -54,24 +67,35 @@ echo ""
 echo "🎯 Step 4: Deploying Echo Server..."
 kubectl apply -f "$SCRIPT_DIR/05-echo-server.yaml"
 echo "✅ Echo Server deployed"
+kubectl set image deployment/echo-server echo-server="$REGISTRY/echo-server:$IMAGE_TAG" -n "$NAMESPACE"
 echo "⏳ Waiting for Echo Server to be ready..."
 kubectl wait --for=condition=ready pod -l app=echo-server -n aiops --timeout=60s
+kubectl rollout status deployment/echo-server -n "$NAMESPACE" --timeout=90s
 
 # Step 5: Deploy Traffic Generator
 echo ""
 echo "🔄 Step 5: Deploying Traffic Generator..."
 kubectl apply -f "$SCRIPT_DIR/06-traffic-gen.yaml"
 echo "✅ Traffic Generator deployed"
+kubectl set image deployment/traffic-gen locust="$REGISTRY/traffic-gen:$IMAGE_TAG" -n "$NAMESPACE"
 echo "⏳ Waiting for Traffic Generator to be ready..."
 sleepfor=120
 echo "Waiting $sleepfor seconds for Locust to start generating load..."
 sleep $sleepfor
+kubectl rollout status deployment/traffic-gen -n "$NAMESPACE" --timeout=120s
 
 # Step 6: Deploy AIOps Engine
 echo ""
 echo "🧠 Step 6: Deploying AIOps Engine (Data Pipeline)..."
 kubectl apply -f "$SCRIPT_DIR/07-aiops-engine.yaml"
 echo "✅ AIOps Engine deployed"
+kubectl set image deployment/aiops-engine aiops-engine="$REGISTRY/aiops-engine:$IMAGE_TAG" -n "$NAMESPACE"
+kubectl set image cronjob/aiops-drift-detection drift-detector="$REGISTRY/aiops-engine:$IMAGE_TAG" -n "$NAMESPACE"
+kubectl rollout status deployment/aiops-engine -n "$NAMESPACE" --timeout=180s
+
+echo "⏳ Verifying health probes..."
+kubectl wait --for=condition=available deployment/aiops-engine -n "$NAMESPACE" --timeout=180s
+kubectl wait --for=condition=ready pod -l app=aiops-engine -n "$NAMESPACE" --timeout=180s
 
 echo ""
 echo "========================================"

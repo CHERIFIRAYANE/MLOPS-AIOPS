@@ -2,88 +2,59 @@ name: CI
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, cleanup ]
   pull_request:
     branches: [ main, master ]
 
 jobs:
-  lint:
-    name: Lint & YAML checks
+  python-tests:
+    name: Python tests and security checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
-      - name: Install linters
+      - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install flake8 yamllint
+          python -m pip install -r aiops-engine/requirements.txt -r echo-server/requirements.txt -r traffic-gen/requirements.txt
+          python -m pip install pytest bandit pip-audit
 
-      - name: Run flake8
+      - name: Run tests
         run: |
-          flake8 --max-line-length=120 || true
+          pytest -q
 
-      - name: YAML lint (k8s manifests)
+      - name: Run secret scanner
         run: |
-          yamllint -c <(cat <<'YAML'
-          extends: default
-          rules:
-            line-length: {max: 180}
-          YAML
-          ) k8s || true
+          python scripts/scan_secrets.py
 
-  security:
-    name: Static security checks
+      - name: Run Bandit
+        run: |
+          bandit -r aiops-engine echo-server traffic-gen monitoring training scripts
+
+      - name: Run pip-audit
+        run: |
+          pip-audit -r aiops-engine/requirements.txt -r echo-server/requirements.txt -r traffic-gen/requirements.txt
+
+  docker-build:
+    name: Build Docker images
     runs-on: ubuntu-latest
+    needs: [python-tests]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-
-      - name: Install security tools
-        run: |
-          python -m pip install --upgrade pip
-          pip install bandit pip-audit
-
-      - name: Run Bandit (SAST)
-        run: |
-          bandit -r . || true
-
-      - name: Run pip-audit (dependency vuln check)
-        run: |
-          pip-audit --progress spinner || true
-      - name: Run repository secrets scanner
-        run: |
-          python scripts/scan_secrets.py || true
-
-  build-images:
-    name: Build Docker images (local)
-    runs-on: ubuntu-latest
-    needs: [lint, security]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
 
       - name: Build aiops-engine image
-        run: |
-          docker build --progress=plain -t aiops-engine:ci ./aiops-engine
+        run: docker build --progress=plain -t aiops-engine:ci ./aiops-engine
 
       - name: Build echo-server image
-        run: |
-          docker build --progress=plain -t echo-server:ci ./echo-server
+        run: docker build --progress=plain -t echo-server:ci ./echo-server
 
       - name: Build traffic-gen image
-        run: |
-          docker build --progress=plain -t traffic-gen:ci ./traffic-gen
+        run: docker build --progress=plain -t traffic-gen:ci ./traffic-gen
