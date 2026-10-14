@@ -17,3 +17,12 @@ def test_ci_workflow_mentions_tests_and_rollout_checks():
     assert "pytest -q" in ci
     assert "bandit" in ci
     assert "pip-audit" in ci
+
+
+def test_grafana_credentials_are_externalized():
+    grafana = Path("k8s/09-grafana.yaml").read_text(encoding="utf-8")
+    assert "secretKeyRef:" in grafana
+    assert 'value: "admin"' not in grafana.split("GF_SECURITY_ADMIN_PASSWORD", 1)[1].split(
+        "GF_AUTH_ANONYMOUS_ENABLED", 1
+    )[0]
+    assert 'value: "false"' in grafana

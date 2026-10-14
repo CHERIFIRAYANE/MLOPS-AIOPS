@@ -8,7 +8,12 @@ PATTERNS = {
     'AWS_KEY': re.compile(r'AKIA[0-9A-Z]{16}'),
     'AWS_SECRET': re.compile(r'AWS[_-]?SECRET', re.I),
     'GITHUB_TOKEN': re.compile(r'ghp_[0-9A-Za-z_]{36}'),
-    'PASSWORD_ASSIGN': re.compile(r'password\s*[=:]\s*\S+', re.I),
+    'PASSWORD_ASSIGN': re.compile(
+        r'password\s*[=:]\s*(?![\'\"]?[$<{])'
+        r'(?![\'\"]?(?:CHANGE_ME|YOUR_|EXAMPLE|REPLACE_ME)\b)'
+        r'[\'\"]?\S+',
+        re.I,
+    ),
 }
 
 
@@ -28,9 +33,12 @@ def main():
     findings = {}
     for p in ROOT.rglob('*'):
         if p.is_file():
-            if any(part.startswith('.') for part in p.parts):
+            # Do not match the scanner's own detection rules as credentials.
+            if p.resolve() == Path(__file__).resolve():
                 continue
-            if p.suffix in {'.png', '.jpg', '.jpeg', '.gif', '.woff', '.woff2', '.zip'}:
+            if any(part.startswith('.') or part == '__pycache__' for part in p.parts):
+                continue
+            if p.suffix in {'.png', '.jpg', '.jpeg', '.gif', '.woff', '.woff2', '.zip', '.pyc'}:
                 continue
             hits = scan_file(p)
             if hits:

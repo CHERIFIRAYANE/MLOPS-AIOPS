@@ -118,6 +118,27 @@ The CI workflow runs on pushes and pull requests and performs:
 
 The CD workflow is intentionally manual. It accepts an image tag, configures `kubectl` from the `KUBECONFIG_B64` GitHub secret, and invokes the same deployment script used locally. This keeps deployment credentials and cluster access explicit rather than pretending this learning cluster is production infrastructure.
 
+### Secrets and production handling
+
+`.gitignore` is committed on purpose: it prevents common local credentials, runtime files, datasets, and model binaries from being added accidentally in future clones. It is not a security boundary and it cannot remove secrets that were already committed. Real credentials must never be placed in YAML, source code, Docker images, notebooks, or Git history.
+
+For this project:
+
+- CI uses GitHub Actions secrets for cluster access. `KUBECONFIG_B64` is consumed only by the manual CD job and is not written to the repository.
+- Grafana now reads its admin password from the Kubernetes Secret `grafana-admin`; the repository contains no Grafana password and anonymous access is disabled.
+- The lightweight scanner is a guardrail, not proof of safety. CI also runs Bandit and `pip-audit`, while GitHub secret scanning and push protection should be enabled on the repository.
+
+For a production deployment, use short-lived GitHub OIDC or workload identity to authenticate to the cloud and cluster instead of storing a long-lived kubeconfig. Store application credentials in a managed secret system such as Azure Key Vault, AWS Secrets Manager, GCP Secret Manager, or HashiCorp Vault, and synchronize only the required values into Kubernetes through an external-secrets controller. Restrict access with least-privilege RBAC, rotate credentials, audit reads, mask them in logs, and use separate secrets per environment. If a secret is ever committed, revoke and rotate it immediately; deleting the file or adding it to `.gitignore` is not sufficient.
+
+Before deploying Grafana locally, create its development secret without committing the value:
+
+```bash
+kubectl create secret generic grafana-admin \
+	--namespace aiops \
+	--from-literal=admin-password="$GRAFANA_ADMIN_PASSWORD" \
+	--dry-run=client -o yaml | kubectl apply -f -
+```
+
 ## Scope and next improvements
 
 This is a portfolio and learning environment, not a production reference architecture. The current deployment uses local image assumptions, a single AIOps engine replica, phase-derived labels, and a simple file-based artifact exchange. Natural next steps are a container registry, immutable image digests, a model registry, stronger identity and network policies, multi-replica availability, temporal cross-validation, and automated integration tests against a disposable Kubernetes cluster.
