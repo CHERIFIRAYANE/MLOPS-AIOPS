@@ -122,6 +122,3 @@ The CD workflow is intentionally manual. It accepts an image tag, configures `ku
 
 This is a portfolio and learning environment, not a production reference architecture. The current deployment uses local image assumptions, a single AIOps engine replica, phase-derived labels, and a simple file-based artifact exchange. Natural next steps are a container registry, immutable image digests, a model registry, stronger identity and network policies, multi-replica availability, temporal cross-validation, and automated integration tests against a disposable Kubernetes cluster.
 
-## Why it belongs in a portfolio
-
-The project shows more than a trained model or a YAML-only deployment. It demonstrates the systems thinking needed to connect application behavior, telemetry, data quality, model quality, Kubernetes control loops, security checks, and recovery decisions. Just as importantly, it records where the first design does not generalize and identifies concrete work to improve it.
