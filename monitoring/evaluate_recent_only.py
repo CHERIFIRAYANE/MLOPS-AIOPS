@@ -65,6 +65,8 @@ def add_ground_truth(df):
 
 def slice_recent_data(df, hours_back=24):
     """Get only last N hours of data"""
+    df = df.copy()
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
     cutoff = df['timestamp'].max() - pd.Timedelta(hours=hours_back)
     df_recent = df[df['timestamp'] >= cutoff]
     return df_recent
@@ -88,10 +90,10 @@ if __name__ == '__main__':
     
     logger.info(f"✓ Loaded {len(df)} total windows")
     
-    df = add_ground_truth(df)
-    
-    # Get ONLY recent 24 hours
+    # Get ONLY recent 24 hours first, then derive labels from that window.
+    # This keeps phase alignment anchored to the evaluated interval.
     df_recent = slice_recent_data(df, hours_back=24)
+    df_recent = add_ground_truth(df_recent)
     
     logger.info(f"✓ Sliced to {len(df_recent)} windows from last 24 hours")
     logger.info(f"  Time range: {df_recent['timestamp'].min()} to {df_recent['timestamp'].max()}")

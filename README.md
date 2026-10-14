@@ -1,79 +1,127 @@
-# Plateforme AIOps pour détection d'anomalies et réentraînement automatique
+# AIOps / MLOps Platform on Kubernetes
 
-Ce dépôt présente une chaîne MLOps complète sur Kubernetes. Le projet montre la collecte de métriques, l'inférence en temps réel, la détection de dérive, le réentraînement automatique et la publication d'un pipeline CI/CD exploitable.
+An end-to-end learning project for operating an anomaly-detection service as a Kubernetes workload. It combines live telemetry, controlled failure injection, model inference, drift evaluation, automated retraining, observability, and delivery automation.
 
-L'objectif n'est pas de faire joli sur un CV. L'objectif est de montrer un travail concret, lisible et vérifiable.
+The goal is deliberately practical: make the full feedback loop visible and testable, from an unhealthy service signal to a model decision and a guarded deployment.
 
-## Ce que contient le projet
+## What this project demonstrates
 
-- `aiops-engine/` pour l'inférence, le suivi des anomalies et l'export Prometheus.
-- `echo-server/` pour simuler une application cible.
-- `traffic-gen/` pour générer de la charge avec Locust.
-- `training/` pour préparer les données et entraîner le modèle.
-- `monitoring/` pour analyser les dérives et produire des rapports.
-- `k8s/` pour le déploiement Kubernetes.
+- **Kubernetes operations:** Deployments, CronJobs, Jobs, Services, probes, PVC-backed shared data, resource requests, and RBAC.
+- **Observability:** Prometheus metrics and Grafana dashboards for service health, anomaly scores, model quality, drift, retraining progress, and audit events.
+- **MLOps workflow:** Feature extraction from time-series windows, supervised Random Forest inference, drift checks, data sufficiency gates, retraining, model artifact versioning, and rollback protection.
+- **DevOps automation:** Dockerized components, GitHub Actions CI, security checks, image builds, rollout verification, and a manually triggered CD workflow.
+- **Operational learning:** A documented experiment showing the difference between strong held-out test performance and weak live-data performance.
 
 ## Architecture
 
-Le flux est simple:
-
-1. `traffic-gen` envoie du trafic vers `echo-server`.
-2. Prometheus collecte les métriques du service cible et du moteur AIOps.
-3. `aiops-engine` lit les métriques, construit une fenêtre temporelle, calcule les features et produit une prédiction.
-4. Un CronJob Kubernetes vérifie la dérive et peut déclencher un réentraînement.
-5. Grafana affiche les métriques, les scores d'anomalie et l'état des jobs.
-
-## CI et CD
-
-Le dépôt inclut une vraie pipeline GitHub Actions:
-
-- tests automatisés avec `pytest`
-- contrôle de sécurité avec `bandit` et `pip-audit`
-- scan de secrets avec `scripts/scan_secrets.py`
-- build des images Docker pour les trois services
-- déploiement continu via un workflow séparé `cd.yml`
-- rollback automatique si les probes Kubernetes ne passent pas pendant le déploiement
-
-Le déploiement est orchestré par `deploy.sh`. Le script applique les manifests, met à jour les images avec le tag construit, attend le statut des rollouts et lance un rollback si une étape échoue.
-
-## Exécution locale
-
-Prérequis:
-
-- Docker Desktop avec Kubernetes activé, ou un cluster Kubernetes accessible
-- `kubectl` configuré
-- Python 3.12 pour les scripts et les tests
-
-Pour démarrer localement:
-
-```bash
-git clone <repo-url>
-cd AiOPs
-docker build -t aiops-engine:local ./aiops-engine
-docker build -t echo-server:local ./echo-server
-docker build -t traffic-gen:local ./traffic-gen
-kubectl apply -f k8s/
+```mermaid
+flowchart LR
+	T[Locust traffic generator] --> E[Echo server]
+	E --> P[Prometheus]
+	P --> I[AIOps engine\n5 s inference loop]
+	I --> M[Anomaly and status metrics]
+	M --> G[Grafana]
+	I --> D[(PVC: dataset and model artifacts)]
+	C[Drift detector\nCronJob every 5 min] --> D
+	C -->|quality + samples + cooldown| R[Retraining Job]
+	R -->|evaluate, back up, deploy or keep old model| D
+	D -->|artifact timestamp change| I
 ```
 
-Pour lancer le déploiement complet avec le script:
+## Runtime flow
+
+1. Locust drives a seven-phase workload against the Echo server: normal traffic, bursts, slow responses, errors, traffic drops, and CPU stress.
+2. The AIOps engine queries Prometheus every five seconds and builds a 12-point, 60-second feature window.
+3. The model classifies the window, exports metrics, records the features, and reports leading contributors through feature importance and standardized deviation.
+4. A Kubernetes CronJob evaluates recent labeled windows every five minutes.
+5. Retraining is considered only when model quality is below the configured ROC-AUC threshold, enough samples exist, and the cooldown permits it.
+6. The retraining Job prepares data, trains a new model, compares it with the previous model, backs up artifacts, and deploys only when the rollback rule allows it.
+7. The running engine detects updated artifacts and hot-reloads the model without a pod restart.
+
+## Repository map
+
+| Path | Responsibility |
+| --- | --- |
+| `aiops-engine/` | Inference loop, model monitoring, drift detection, retraining, and status export |
+| `echo-server/` | Target HTTP service with controllable fault modes |
+| `traffic-gen/` | Locust workload and fault-injection schedule |
+| `training/` | Dataset preparation and model training |
+| `monitoring/` | Evaluation, drift analysis, and report generation |
+| `k8s/` | Kubernetes resources for the platform and MLOps automation |
+| `tests/` | Repository smoke tests for documentation and delivery contracts |
+| `.github/workflows/` | CI checks and manually triggered CD |
+
+## Engineering decisions worth reviewing
+
+- **Retraining gates:** ROC-AUC below `0.80`, at least `200` samples, and a configurable time gate. The CronJob uses `Forbid` concurrency to avoid overlapping checks.
+- **Deployment safeguard:** New models are evaluated before artifact replacement. The previous model is backed up and a model that exceeds the configured `0.02` ROC-AUC degradation tolerance is rejected.
+- **Shared state:** PVCs preserve collected data, status, and model artifacts across pod restarts and allow the inference, drift, and retraining components to coordinate.
+- **Least-privilege direction:** The drift detector uses a dedicated service account and RBAC rules limited to the batch and pod resources needed to launch and inspect retraining Jobs.
+- **Runtime visibility:** Status is written as JSON and Prometheus-compatible metrics, creating an audit trail for model health, gate decisions, retraining steps, and rollback events.
+
+## Observed validation result
+
+The retraining lifecycle is documented in [`RETRAINING_LIFECYCLE_TIMELINE.md`](RETRAINING_LIFECYCLE_TIMELINE.md). In the recorded run:
+
+| Check | Result |
+| --- | --- |
+| Initial live ROC-AUC | `0.506`, triggering the quality gate |
+| Data sufficiency gate | Correctly blocked retraining at `50 < 200` samples |
+| Retraining input | `18,631` labeled windows and `96` features |
+| New model test ROC-AUC | `1.00` on the held-out split |
+| Post-retrain live ROC-AUC | `0.505` |
+| Interpretation | The automation worked, but retraining alone did not solve the distribution shift |
+
+This is an important limitation, not a hidden success metric: the next engineering steps are stronger temporal validation, better labels, richer features, and an unsupervised or hybrid detector.
+
+## Run locally
+
+### Prerequisites
+
+- Docker Desktop with Kubernetes enabled, or another accessible Kubernetes cluster
+- `kubectl` configured for that cluster
+- Python 3.12 for tests and repository scripts
+- Bash through Git Bash or WSL on Windows
+
+### Deploy the stack
 
 ```bash
+git clone <repository-url>
+cd AiOPs
 bash deploy.sh latest
 ```
 
-## Qualité et sécurité
-
-Les modèles binaires `*.pkl` ne sont pas conservés dans le dépôt public. Ils sont régénérés localement ou stockés à part. Le dépôt garde aussi une `.gitignore` propre pour éviter les fichiers d'environnement, les logs et les artefacts runtime.
-
-Un test de fumée est présent dans `tests/test_repo_smoke.py` pour vérifier que le README, la CI et le CD restent cohérents avec le dépôt.
-
-## Validation rapide
+The deployment script builds the three images, applies the Kubernetes resources, waits for rollouts and readiness probes, and requests a rollback if deployment fails. For a staged deployment of the MLOps automation resources, use:
 
 ```bash
-python -m pytest -q tests/test_repo_smoke.py
+bash deploy-mlops-stack.sh
+```
+
+Useful local endpoints after port-forwarding include Prometheus on `9090`, Grafana on `3000`, and the Echo server on `5000`.
+
+### Validate the repository
+
+```bash
+python -m pytest -q
 bash -n deploy.sh
 ```
 
-## À retenir
+## CI/CD and security
 
-Ce projet met en avant une base sérieuse pour un poste DevSecOps ou MLOps: automatisation, sécurité, déploiement Kubernetes, rollback et documentation claire.
+The CI workflow runs on pushes and pull requests and performs:
+
+- `pytest`
+- the repository secret scanner in `scripts/scan_secrets.py`
+- Bandit static analysis
+- `pip-audit` dependency auditing
+- Docker builds for the AIOps engine, Echo server, and traffic generator
+
+The CD workflow is intentionally manual. It accepts an image tag, configures `kubectl` from the `KUBECONFIG_B64` GitHub secret, and invokes the same deployment script used locally. This keeps deployment credentials and cluster access explicit rather than pretending this learning cluster is production infrastructure.
+
+## Scope and next improvements
+
+This is a portfolio and learning environment, not a production reference architecture. The current deployment uses local image assumptions, a single AIOps engine replica, phase-derived labels, and a simple file-based artifact exchange. Natural next steps are a container registry, immutable image digests, a model registry, stronger identity and network policies, multi-replica availability, temporal cross-validation, and automated integration tests against a disposable Kubernetes cluster.
+
+## Why it belongs in a portfolio
+
+The project shows more than a trained model or a YAML-only deployment. It demonstrates the systems thinking needed to connect application behavior, telemetry, data quality, model quality, Kubernetes control loops, security checks, and recovery decisions. Just as importantly, it records where the first design does not generalize and identifies concrete work to improve it.
